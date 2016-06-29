@@ -17,6 +17,8 @@ use std::env::VarError;
 use std::ffi::{OsStr, OsString};
 
 use extern_url;
+use extern_url::percent_encoding::percent_decode;
+use rustc_serialize::base64::{STANDARD, ToBase64};
 
 use error::{Error, Result};
 
@@ -128,27 +130,62 @@ pub fn var_os<K: AsRef<OsStr>>(key: K) -> std::option::Option<OsString> {
 /// * If the URL scheme is not a valid type (currently only supported schemes are http and https)
 /// * If the URL is missing a host/domain segement
 /// * If the URL is missing a port number and a default cannot be determined
-pub fn http_proxy() -> Result<Option<(String, u16)>> {
+pub fn http_proxy() -> Result<Option<(String, u16, Option<String>)>> {
     match self::var("http_proxy") {
-        Ok(url) => {
-            let url = try!(extern_url::Url::parse(&url));
-            match url.scheme() {
-                "http" | "https" => (),
-                scheme => {
-                    let msg = format!("Invalid scheme {} for {}", &scheme, &url);
-                    return Err(Error::InvalidProxyValue(msg));
-                }
-            };
-            let host = match url.host_str() {
-                Some(val) => val,
-                None => return Err(Error::UrlParseError(extern_url::ParseError::EmptyHost)),
-            };
-            let port = match url.port_or_known_default() {
-                Some(val) => val,
-                None => return Err(Error::UrlParseError(extern_url::ParseError::InvalidPort)),
-            };
-            Ok(Some((host.to_string(), port)))
-        }
+        Ok(url) => parse_proxy_url(&url),
+        _ => Ok(None),
+    }
+}
+
+/// Returns a host/port tuple from the `https_proxy` environment variable, if it is set.
+///
+/// The value of `https_proxy` must be a parseable URL such as `https://proxy.company.com:8001/`
+/// otherwise a parsing error will be returned. If the port is not present, than the default port
+/// numbers of http/80 and https/443 will be returned. Currently user authentication is not
+/// supported. If the `https_proxy` environment variable is not set or is empty, then a `Result` of
+/// `None` will be returned.
+///
+/// References:
+///
+/// * https://www.gnu.org/software/wget/manual/html_node/Proxies.html
+/// * https://wiki.archlinux.org/index.php/proxy_settings
+/// * https://msdn.microsoft.com/en-us/library/hh272656(v=vs.120).aspx
+/// * http://www.cyberciti.biz/faq/linux-unix-set-proxy-environment-variable/
+///
+/// # Examples
+///
+/// Behavior when environment variable is set:
+///
+/// ```
+/// use std;
+/// use habitat_core::env;
+///
+/// std::env::set_var("https_proxy", "http://proxy.example.com:8001/");
+/// let (host, port) = env::https_proxy().unwrap().unwrap();
+///
+/// assert_eq!(&host, "proxy.example.com");
+/// assert_eq!(port, 8001);
+/// ```
+/// Behavior when environment variable is empty:
+///
+/// ```
+/// use std;
+/// use habitat_core::env;
+///
+/// std::env::set_var("https_proxy", "");
+///
+/// assert_eq!(env::https_proxy().unwrap(), None);
+/// ```
+///
+/// # Errors
+///
+/// * If the value of the `https_proxy` environment variable cannot be parsed as a URL
+/// * If the URL scheme is not a valid type (currently only supported schemes are http and https)
+/// * If the URL is missing a host/domain segement
+/// * If the URL is missing a port number and a default cannot be determined
+pub fn https_proxy() -> Result<Option<(String, u16, Option<String>)>> {
+    match self::var("https_proxy") {
+        Ok(url) => parse_proxy_url(&url),
         _ => Ok(None),
     }
 }
@@ -169,7 +206,7 @@ pub fn http_proxy() -> Result<Option<(String, u16)>> {
 ///
 /// # Examples
 ///
-/// Behavior when domain matches extension set:
+/// Behavior when domain matches extension set for http_proxy:
 ///
 /// ```
 /// use std;
@@ -178,7 +215,21 @@ pub fn http_proxy() -> Result<Option<(String, u16)>> {
 /// std::env::set_var("http_proxy", "http://proxy.example.com:8001/");
 /// std::env::set_var("no_proxy", "localhost,127.0.0.1,localaddress,.localdomain.com");
 ///
-/// assert_eq!(env::http_proxy_unless_domain_exempted("server.localdomain.com").unwrap(), None);
+/// assert_eq!(
+///     env::http_proxy_unless_domain_exempted("http", "server.localdomain.com").unwrap(), None);
+/// ```
+///
+/// Behavior when domain matches extension set for https_proxy:
+///
+/// ```
+/// use std;
+/// use habitat_core::env;
+///
+/// std::env::set_var("https_proxy", "http://proxy.example.com:8001/");
+/// std::env::set_var("no_proxy", "localhost,127.0.0.1,localaddress,.localdomain.com");
+///
+/// assert_eq!(
+///     env::http_proxy_unless_domain_exempted("https", "server.localdomain.com").unwrap(), None);
 /// ```
 ///
 /// Behavior when domain does not match extension set:
@@ -189,13 +240,16 @@ pub fn http_proxy() -> Result<Option<(String, u16)>> {
 ///
 /// std::env::set_var("http_proxy", "http://proxy.example.com:8001/");
 /// std::env::set_var("no_proxy", "localhost,127.0.0.1,localaddress,.localdomain.com");
-/// let (host, port) = env::http_proxy_unless_domain_exempted("www.example.com").unwrap().unwrap();
+/// let (host, port) = env::http_proxy_unless_domain_exempted("http", "www.example.com")
+///     .unwrap().unwrap();
 ///
 /// assert_eq!(&host, "proxy.example.com");
 /// assert_eq!(port, 8001);
 /// ```
 ///
-pub fn http_proxy_unless_domain_exempted(domain: &str) -> Result<Option<(String, u16)>> {
+pub fn http_proxy_unless_domain_exempted(scheme: &str,
+                                         domain: &str)
+                                         -> Result<Option<(String, u16, Option<String>)>> {
     match self::var("no_proxy") {
         Ok(domains) => {
             for extension in domains.split(',') {
@@ -207,8 +261,46 @@ pub fn http_proxy_unless_domain_exempted(domain: &str) -> Result<Option<(String,
                     return Ok(None);
                 }
             }
-            http_proxy()
+            match scheme {
+                "https" => https_proxy(),
+                _ => http_proxy(),
+            }
         }
-        _ => http_proxy(),
+        _ => {
+            match scheme {
+                "https" => https_proxy(),
+                _ => http_proxy(),
+            }
+        }
     }
+}
+
+fn parse_proxy_url(url: &str) -> Result<Option<(String, u16, Option<String>)>> {
+    let url = try!(extern_url::Url::parse(&url));
+    match url.scheme() {
+        "http" | "https" => (),
+        scheme => {
+            let msg = format!("Invalid scheme {} for {}", &scheme, &url);
+            return Err(Error::InvalidProxyValue(msg));
+        }
+    };
+    let host = match url.host_str() {
+        Some(val) => val,
+        None => return Err(Error::UrlParseError(extern_url::ParseError::EmptyHost)),
+    };
+    let port = match url.port_or_known_default() {
+        Some(val) => val,
+        None => return Err(Error::UrlParseError(extern_url::ParseError::InvalidPort)),
+    };
+    let basic_auth = match url.password() {
+        Some(password) => {
+            Some(format!("{}:{}",
+                         percent_decode(url.username().as_bytes()).decode_utf8_lossy(),
+                         percent_decode(password.as_bytes()).decode_utf8_lossy())
+                .as_bytes()
+                .to_base64(STANDARD))
+        }
+        None => None,
+    };
+    Ok(Some((host.to_string(), port, basic_auth)))
 }

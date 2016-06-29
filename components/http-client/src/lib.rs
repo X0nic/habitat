@@ -24,8 +24,9 @@ pub mod error;
 use std::sync::Arc;
 use std::path::Path;
 
+use hab_core::env::http_proxy_unless_domain_exempted;
 use hab_core::util::sys;
-use hyper::client::Client;
+use hyper::client::{Client, ProxyConfig};
 use hyper::client::pool::{Config, Pool};
 use hyper::header::UserAgent;
 use hyper::http::h1::Http11Protocol;
@@ -34,6 +35,8 @@ use hyper::Url;
 use openssl::ssl::{SslContext, SslMethod, SSL_OP_NO_SSLV2, SSL_OP_NO_SSLV3, SSL_OP_NO_COMPRESSION};
 
 pub use error::{Error, Result};
+
+header! { (ProxyAuthorization, "Proxy-Authorization") => [String] }
 
 /// Builds a new hyper HTTP client with appropriate SSL configuration and HTTP/HTTPS proxy support.
 ///
@@ -65,11 +68,42 @@ pub use error::{Error, Result};
 /// library will default to using this on the Mac. Therefore the behavior on the Mac remains
 /// unchanged and will use the system's certificates.
 ///
-pub fn new_hyper_client(_for_domain: Option<&Url>, fs_root_path: Option<&Path>) -> Result<Client> {
+pub fn new_hyper_client(for_domain: Option<&Url>, fs_root_path: Option<&Path>) -> Result<Client> {
+    let (scheme, for_domain) = match for_domain {
+        Some(url) => (url.scheme(), url.host_str().unwrap_or("")),
+        None => ("", ""),
+    };
     let ctx = try!(ssl_ctx(fs_root_path));
-    let connector = HttpsConnector::new(Openssl { context: Arc::new(ctx) });
-    let pool = Pool::with_connector(Config::default(), connector);
-    Ok(Client::with_protocol(Http11Protocol::with_connector(pool)))
+    let ssl_client = Openssl { context: Arc::new(ctx) };
+    match try!(http_proxy_unless_domain_exempted(scheme, for_domain)) {
+        Some((proxy_host, proxy_port, _)) => {
+            debug!("Using proxy {}:{}...", &proxy_host, &proxy_port);
+            Ok(Client::with_proxy_config(ProxyConfig(proxy_host, proxy_port, ssl_client)))
+        }
+        None => {
+            let connector = HttpsConnector::new(ssl_client);
+            let pool = Pool::with_connector(Config::default(), connector);
+            Ok(Client::with_protocol(Http11Protocol::with_connector(pool)))
+        }
+    }
+}
+
+/// Returns a Proxy-Authorization HTTP header which contains a username and password fetched from
+/// either an `http_proxy` or `https_proxy` environment variable. The optionally provided
+/// `for_domain` URL is used to determine which environment variable to use (i.e. http or https
+/// scheme). Only `Basic` authentication is supported.
+pub fn proxy_basic_auth(for_domain: Option<&Url>) -> Result<Option<ProxyAuthorization>> {
+    let (scheme, for_domain) = match for_domain {
+        Some(url) => (url.scheme(), url.host_str().unwrap_or("")),
+        None => ("", ""),
+    };
+    match try!(http_proxy_unless_domain_exempted(scheme, for_domain)) {
+        Some((_, _, Some(basic_auth))) => {
+            debug!("Proxy-Authorization: Basic {}", &basic_auth);
+            Ok(Some(ProxyAuthorization(format!("Basic {}", basic_auth))))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Returns an HTTP User-Agent string type for use by Hyper when making HTTP requests.

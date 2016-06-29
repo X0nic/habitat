@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 use broadcast::BroadcastWriter;
 use hab_core::package::{Identifiable, PackageArchive};
-use hab_http::new_hyper_client;
+use hab_http::{ProxyAuthorization, new_hyper_client, proxy_basic_auth};
 use hyper::client::{Body, IntoUrl, Response};
 use hyper::status::StatusCode;
 use hyper::header::{Headers, Authorization, Bearer};
@@ -54,6 +54,7 @@ pub trait DisplayProgress: Write {
 pub struct Client {
     depot_url: Url,
     client: hyper::Client,
+    proxy_basic_auth: Option<ProxyAuthorization>,
 }
 
 impl Client {
@@ -62,6 +63,7 @@ impl Client {
         Ok(Client {
             depot_url: url.clone(),
             client: try!(new_hyper_client(Some(&url), fs_root_path)),
+            proxy_basic_auth: try!(proxy_basic_auth(Some(&url))),
         })
     }
 
@@ -85,7 +87,10 @@ impl Client {
     pub fn show_origin_keys(&self, origin: &str) -> Result<Vec<depotsrv::OriginKeyIdent>> {
         let url = try!(self.url_join(&format!("origins/{}/keys", origin)));
         debug!("GET {} with {:?}", &url, &self.client);
-        let request = self.client.get(url);
+        let mut request = self.client.get(url);
+        if let Some(header) = self.proxy_basic_auth.clone() {
+            request = request.header(header);
+        }
         let mut res = try!(request.send());
         debug!("Response: {:?}", res);
 
@@ -119,6 +124,9 @@ impl Client {
                           -> Result<()> {
         let mut headers = Headers::new();
         headers.set(Authorization(Bearer { token: token.to_string() }));
+        if let Some(header) = self.proxy_basic_auth.clone() {
+            headers.set(header);
+        }
         let url = try!(self.url_join(&format!("origins/{}/keys/{}", &origin, &revision)));
         let mut file = try!(File::open(src_path));
         let file_size = try!(file.metadata()).len();
@@ -164,6 +172,9 @@ impl Client {
                                  -> Result<()> {
         let mut headers = Headers::new();
         headers.set(Authorization(Bearer { token: token.to_string() }));
+        if let Some(header) = self.proxy_basic_auth.clone() {
+            headers.set(header);
+        }
         let url = try!(self.url_join(&format!("origins/{}/secret_keys/{}", &origin, &revision)));
         let mut file = try!(File::open(src_path));
         let file_size = try!(file.metadata()).len();
@@ -231,7 +242,10 @@ impl Client {
     pub fn show_package<I: Identifiable>(&self, ident: I) -> Result<depotsrv::Package> {
         let url = try!(self.url_show_package(&ident));
         debug!("GET {} with {:?}", &url, &self.client);
-        let request = self.client.get(url);
+        let mut request = self.client.get(url);
+        if let Some(header) = self.proxy_basic_auth.clone() {
+            request = request.header(header);
+        }
         let mut res = try!(request.send());
 
         if res.status != hyper::status::StatusCode::Ok {
@@ -262,6 +276,9 @@ impl Client {
                        -> Result<()> {
         let mut headers = Headers::new();
         headers.set(Authorization(Bearer { token: token.to_string() }));
+        if let Some(header) = self.proxy_basic_auth.clone() {
+            headers.set(header);
+        }
         let checksum = try!(pa.checksum());
         let ident = try!(pa.ident());
         let mut file = try!(File::open(&pa.path));
@@ -305,7 +322,11 @@ impl Client {
                 progress: Option<&mut DisplayProgress>)
                 -> Result<PathBuf> {
         debug!("GET {} with {:?}", &url, &self.client);
-        let mut res = try!(self.client.get(url).send());
+        let mut request = self.client.get(url);
+        if let Some(header) = self.proxy_basic_auth.clone() {
+            request = request.header(header);
+        }
+        let mut res = try!(request.send());
         debug!("Response: {:?}", res);
 
         if res.status != hyper::status::StatusCode::Ok {
