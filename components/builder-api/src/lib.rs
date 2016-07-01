@@ -24,6 +24,7 @@ extern crate lazy_static;
 #[macro_use]
 extern crate log;
 extern crate mount;
+extern crate persistent;
 extern crate protobuf;
 extern crate redis;
 #[macro_use]
